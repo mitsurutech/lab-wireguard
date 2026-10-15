@@ -1,0 +1,238 @@
+# Networking lab: a WireGuard tunnel between two sites
+# Two sites are network namespaces in this one VM, joined by an "internet" link that carries
+# neither private network. wireguard-tools is installed by the setup below, from Ubuntu's archive,
+# the first time it starts.
+cpus: 1
+memory: 1024    # MB
+disk: 10        # GB
+
+# Nothing opens in the browser: the lab is the terminal.
+open: []
+
+# Run once, as root. Its output is kept in /var/log/mitsurutech-setup.log on the VM.
+setup: |
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq wireguard-tools tcpdump traceroute iproute2 netcat-openbsd iputils-ping
+  cat > /usr/local/bin/wglab <<'WGLAB_TOOL_END'
+  #!/bin/bash
+  # wglab: two sites as network namespaces in this VM.
+  #   wglab up | down | status | shell <node>      nodes: a1 gwA gwB b1
+  # A gateway's WireGuard files are /etc/netns/<gateway>/wireguard, which the gateway itself sees
+  # as /etc/wireguard. up brings wg0 up in each gateway from its wg0.conf, when there is one.
+  [ "$(id -u)" = 0 ] || exec sudo "$0" "$@"
+  NODES="a1 gwA gwB b1"
+  GATEWAYS="gwA gwB"
+  ex() { ip netns exec "$@"; }
+  link() {
+    ip link add "$2" netns "$1" type veth peer name "$5" netns "$4" || exit 1
+    ip -n "$1" addr add "$3" dev "$2"; ip -n "$1" link set "$2" up
+    ip -n "$4" addr add "$6" dev "$5"; ip -n "$4" link set "$5" up
+  }
+  up() {
+    if ip netns list | grep -qw gwA; then echo "wglab: already up (wglab down first)"; exit 1; fi
+    for n in $NODES; do ip netns add $n; ip -n $n link set lo up; done
+    for g in $GATEWAYS; do
+      ex $g sysctl -qw net.ipv4.ip_forward=1
+      mkdir -p /etc/netns/$g/wireguard; chmod 700 /etc/netns/$g/wireguard
+    done
+    link a1 to-gwA 10.1.0.2/24 gwA to-a1 10.1.0.1/24
+    link b1 to-gwB 10.2.0.2/24 gwB to-b1 10.2.0.1/24
+    link gwA wan0 203.0.113.1/24 gwB wan0 203.0.113.2/24
+    ip -n a1 route add default via 10.1.0.1
+    ip -n b1 route add default via 10.2.0.1
+    for g in $GATEWAYS; do
+      [ -f /etc/netns/$g/wireguard/wg0.conf ] || continue
+      ex $g wg-quick up wg0 >>/var/log/wglab.log 2>&1 || echo "wglab: wg-quick failed in $g, see /var/log/wglab.log"
+    done
+    echo "wglab: up: $NODES"
+  }
+  down() { for n in $NODES; do ip netns del $n 2>/dev/null; done; }
+  status() {
+    ip netns list | grep -qw gwA || { echo "wglab: not up (wglab up)"; exit 1; }
+    for n in $NODES; do
+      echo "$n"
+      ex $n ip -br -4 addr | grep -v '^lo ' | awk '{print "  " $1, $3}'
+      ex $n wg show wg0 2>/dev/null | sed -n 's/^peer:.*/  peer/p;s/^  latest handshake: /  latest handshake: /p'
+    done
+  }
+  shell() {
+    case " $NODES " in *" $1 "*) ;; *) echo "wglab: no node $1 (one of: $NODES)"; exit 1;; esac
+    mkdir -p /run/wglab
+    echo "PS1='$1# '" > /run/wglab/$1.rc
+    exec ip netns exec $1 bash --rcfile /run/wglab/$1.rc -i
+  }
+  case "$1" in
+    up) up;; down) down;; status|"") status;; shell) shell "$2";;
+    *) sed -n '2,3p' "$0"; exit 1;;
+  esac
+  WGLAB_TOOL_END
+  chmod 755 /usr/local/bin/wglab
+  cat > /etc/systemd/system/wglab.service <<'WGLAB_UNIT_END'
+  [Unit]
+  Description=WireGuard lab: two sites as namespaces
+  After=network.target
+
+  [Service]
+  Type=oneshot
+  RemainAfterExit=yes
+  ExecStart=/usr/local/bin/wglab up
+  ExecStop=/usr/local/bin/wglab down
+
+  [Install]
+  WantedBy=multi-user.target
+  WGLAB_UNIT_END
+  systemctl daemon-reload
+  systemctl enable wglab >/dev/null 2>&1
+  home=/home/student
+  [ -d $home ] || home=/root
+  cat > $home/README.md <<'WGLAB_README_END'
+  # Lab: a WireGuard tunnel between two sites
+
+  Four machines, built in this VM. Each is a network namespace, joined by virtual cables.
+
+      site A                                                site B
+      a1 ---- gwA -------- the internet -------- gwB ---- b1
+      10.1.0.0/24          203.0.113.0/24          10.2.0.0/24
+
+  | link             | network        | first address   | second address  |
+  |------------------|----------------|-----------------|-----------------|
+  | a1 - gwA         | 10.1.0.0/24    | gwA 10.1.0.1    | a1 10.1.0.2     |
+  | gwA - gwB (wan0) | 203.0.113.0/24 | gwA 203.0.113.1 | gwB 203.0.113.2 |
+  | gwB - b1         | 10.2.0.0/24    | gwB 10.2.0.1    | b1 10.2.0.2     |
+
+  Each host's default route points at its gateway, and both gateways forward packets. The
+  internet link carries 203.0.113.0/24 and nothing else: it has never heard of the two private
+  networks, and it must stay that way. They are to reach each other only through a tunnel.
+
+  ## What to do
+
+  1. Ping b1 (10.2.0.2) from a1. It fails. Use `traceroute -n` and `ip route` on a1 and on gwA
+     to see where the packet stops and why.
+  2. Open a shell on each gateway (`wglab shell gwA`). Make a key pair on each, a private key
+     and the public key made from it, with `wg genkey` and `wg pubkey`. A private key is a
+     secret: look at who can read each file you make.
+  3. In each gateway write `/etc/wireguard/wg0.conf`. Give each end of the tunnel an address of
+     its own, on a network that is neither of the two LANs nor the internet link. Each gateway
+     names the other as its peer by public key, and says which networks may go to that peer.
+     One of the two needs to be told where to find the other.
+  4. Bring the tunnel up in each gateway (`man wg-quick`) and look at it with `wg show`.
+  5. Ping b1 from a1 again. In a second terminal watch the internet link while you do:
+     `sudo ip netns exec gwA tcpdump -ni wan0`. What crosses it, and what does not?
+  6. Restart the lab with `wglab down` and then `wglab up`. Only what is saved in the
+     configuration files comes back. The tunnel must come up by itself, with a handshake, and
+     a1 must still reach b1.
+
+  Your teacher's check reads the real state: the handshake, the traffic on the internet link,
+  the routes, the saved files and who can read the keys.
+
+  ## The tools
+
+  - `wglab status`          every machine and its addresses
+  - `wglab shell <node>`    a shell inside a1, gwA, gwB or b1
+  - `wglab down`, `wglab up`   take the lab down and build it again, bringing wg0 up from the saved files
+  - `sudo ip netns exec gwA <command>`    what wglab shell does, by hand
+  - `wg show`, `ip -br addr`, `ip route`, `tcpdump -ni wan0` work in any machine the same way
+
+  A gateway sees its own `/etc/wireguard`. On the VM that directory is
+  `/etc/netns/gwA/wireguard` for gwA and `/etc/netns/gwB/wireguard` for gwB.
+  WGLAB_README_END
+  chown student:student $home/README.md 2>/dev/null
+  echo "Read README.md in your home folder first." > /etc/motd
+  systemctl start wglab 2>/dev/null || wglab up
+
+# Marks a handed-in VM, KAN-29: run as root on a copy of the saved disk after a fresh boot, so
+# it sees only what was saved. Its exit status is the result: 0 passes.
+check: |
+  CAP=
+  fail() {
+    [ -z "$CAP" ] || kill $CAP 2>/dev/null
+    echo "NOT PASSED: $*"
+    for g in gwA gwB; do
+      echo "--- $g"; ip -n $g -br -4 addr 2>&1 | head -6; ip -n $g route 2>&1 | head -8; ip netns exec $g wg show 2>&1 | head -12
+    done
+    exit 1
+  }
+  for i in $(seq 1 30); do ip netns list | grep -qw gwB && break; sleep 1; done
+  ip netns list | grep -qw gwB || wglab up >/dev/null 2>&1
+
+  # What was saved: each gateway's own wg0.conf, readable by root alone, with a real key pair.
+  conf() {
+    f=/etc/netns/$1/wireguard/wg0.conf
+    [ -f "$f" ] || fail "$1 has no wg0.conf: it goes in /etc/wireguard inside $1, which is $f on this VM"
+    [ $(( 8#$(stat -c %a "$f") & 63 )) -eq 0 ] || fail "$1's wg0.conf holds a private key and must be readable by its owner alone (mode 600), it is $(stat -c %a "$f")"
+    key=$(sed -n 's/^PrivateKey *= *//p' "$f" | head -1 | tr -d ' \r')
+    [ -n "$key" ] || fail "$1's wg0.conf has no PrivateKey"
+    pub=$(echo "$key" | wg pubkey 2>/dev/null)
+    [ -n "$pub" ] || fail "the PrivateKey in $1's wg0.conf is not a WireGuard key"
+  }
+  conf gwA; KA=$key; PA=$pub
+  conf gwB; KB=$key; PB=$pub
+  [ "$KA" != "$KB" ] || fail "both gateways have the same private key: each needs a key pair of its own"
+  peer() { sed -n 's/^PublicKey *= *//p' /etc/netns/$1/wireguard/wg0.conf | head -1 | tr -d ' \r'; }
+  [ "$(peer gwA)" = "$PB" ] || fail "gwA's peer is not gwB: its PublicKey is not the public key of gwB's private key"
+  [ "$(peer gwB)" = "$PA" ] || fail "gwB's peer is not gwA: its PublicKey is not the public key of gwA's private key"
+  grep -hE '^AllowedIPs' /etc/netns/gwA/wireguard/wg0.conf | grep -qF 10.2.0.0/24 || fail "gwA's peer is not allowed 10.2.0.0/24, so nothing for site B goes into the tunnel"
+  grep -hE '^AllowedIPs' /etc/netns/gwB/wireguard/wg0.conf | grep -qF 10.1.0.0/24 || fail "gwB's peer is not allowed 10.1.0.0/24, so nothing for site A goes into the tunnel"
+  cat /etc/netns/gwA/wireguard/wg0.conf /etc/netns/gwB/wireguard/wg0.conf | grep -qE '^Endpoint *= *203\.0\.113\.[12]:[0-9]+' || fail "neither gateway is told where to find the other on the internet link"
+  # A private key is nobody else's: wherever a copy of one was written, it is not world-readable.
+  for k in "$KA" "$KB"; do
+    for f in $(grep -rlF --exclude-dir=proc --exclude-dir=sys -- "$k" /etc /home /root /tmp /var/tmp 2>/dev/null); do
+      [ $(( 8#$(stat -c %a "$f") & 7 )) -eq 0 ] || fail "$f holds a private key and anybody can read it (mode $(stat -c %a "$f"))"
+    done
+  done
+
+  # The machines are as they were built: every address, and nothing else on any of them.
+  while read n d a; do
+    ip -n $n -4 -o addr show dev $d 2>/dev/null | grep -q " $a " || fail "$n should have $a on $d: the lab was changed"
+  done <<TABLE_END
+  a1 to-gwA 10.1.0.2/24
+  gwA to-a1 10.1.0.1/24
+  gwA wan0 203.0.113.1/24
+  gwB wan0 203.0.113.2/24
+  gwB to-b1 10.2.0.1/24
+  b1 to-gwB 10.2.0.2/24
+  TABLE_END
+  for n in a1 b1; do
+    [ "$(ip -n $n -4 -o addr show | awk '$2 != "lo"' | wc -l)" = 1 ] || fail "$n has an address that was added"
+  done
+  for g in gwA gwB; do
+    [ "$(ip -n $g -4 -o addr show | awk '{sub(/@.*/, "", $2)} $2 != "lo" && $2 != "wg0"' | wc -l)" = 2 ] || fail "$g has an address that was added besides wg0's"
+    [ "$(ip -n $g -4 -o addr show dev lo | wc -l)" = 1 ] || fail "$g has an extra address on lo"
+    ip -n $g -4 -o addr show dev wg0 2>/dev/null | grep -qE ' (10\.1\.0\.|10\.2\.0\.|203\.0\.113\.)' && fail "wg0 in $g has an address on one of the lab's own networks: the tunnel needs a network of its own"
+    [ -z "$(ip -n $g route show dev wan0 | grep -v '^203\.0\.113\.0/24')" ] || fail "$g has a route out of the internet link beyond its own network: the private networks must never be routed there"
+  done
+
+  # What is running was built from the saved files, and the far LAN goes into the tunnel.
+  [ "$(ip netns exec gwA wg show wg0 public-key 2>/dev/null)" = "$PA" ] || fail "wg0 is not up in gwA with the key saved in its wg0.conf"
+  [ "$(ip netns exec gwB wg show wg0 public-key 2>/dev/null)" = "$PB" ] || fail "wg0 is not up in gwB with the key saved in its wg0.conf"
+  ip -n gwA route get 10.2.0.2 2>/dev/null | grep -q " dev wg0 " || fail "gwA does not send 10.2.0.2 into wg0"
+  ip -n gwB route get 10.1.0.2 2>/dev/null | grep -q " dev wg0 " || fail "gwB does not send 10.1.0.2 into wg0"
+  [ "$(ip -n gwA -4 -o addr show dev wg0 | wc -l)" -ge 1 ] || fail "wg0 in gwA has no address"
+  [ "$(ip -n gwB -4 -o addr show dev wg0 | wc -l)" -ge 1 ] || fail "wg0 in gwB has no address"
+
+  # Real traffic, watched on the internet link.
+  moved() { ip netns exec $1 wg show wg0 transfer | awk '{s += $2 + $3} END {print s + 0}'; }
+  BEFORE=$(moved gwA)
+  rm -f /tmp/wglab-check.pcap
+  ip netns exec gwA timeout 30 tcpdump -ni wan0 -U -w /tmp/wglab-check.pcap >/dev/null 2>&1 &
+  CAP=$!
+  for i in $(seq 1 20); do [ -s /tmp/wglab-check.pcap ] && break; sleep 0.25; done
+  sleep 1
+  ip netns exec a1 ping -c 4 -W 2 -q 10.2.0.2 >/dev/null 2>&1 || fail "a1 cannot reach b1 at 10.2.0.2"
+  ip netns exec b1 ping -c 2 -W 2 -q 10.1.0.2 >/dev/null 2>&1 || fail "b1 cannot reach a1 at 10.1.0.2"
+  sleep 1
+  kill $CAP 2>/dev/null; wait $CAP 2>/dev/null; CAP=
+  [ "$(moved gwA)" -gt "$BEFORE" ] || fail "the pings did not move a byte through wg0, so they went some other way"
+  now=$(date +%s)
+  for g in gwA gwB; do
+    t=$(ip netns exec $g wg show wg0 latest-handshakes | awk 'NR == 1 {print $2}')
+    [ -n "$t" ] && [ "$t" -gt 0 ] || fail "$g has never had a handshake with its peer"
+    [ $((now - t)) -lt 180 ] || fail "$g's last handshake was $((now - t)) seconds ago, not recent"
+  done
+  LA=$(ip netns exec gwA wg show wg0 listen-port); LB=$(ip netns exec gwB wg show wg0 listen-port)
+  P=/tmp/wglab-check.pcap
+  [ "$(tcpdump -nr $P 'ip and not udp' 2>/dev/null | wc -l)" = 0 ] || fail "the internet link carried packets that are not UDP, such as ICMP: the traffic is not going through the tunnel"
+  [ "$(tcpdump -nr $P 'host 10.1.0.2 or host 10.2.0.2' 2>/dev/null | wc -l)" = 0 ] || fail "a private address was visible on the internet link: the traffic was not encrypted"
+  [ "$(tcpdump -nr $P "udp and (port $LA or port $LB)" 2>/dev/null | wc -l)" -ge 4 ] || fail "no WireGuard packets were seen on the internet link"
+  echo "PASSED: a1 and b1 reach each other through a WireGuard tunnel between gwA and gwB built from their saved wg0.conf, the internet link carries only UDP, and the keys are private"
