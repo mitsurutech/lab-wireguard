@@ -1,5 +1,7 @@
 # WireGuard lab: a VPN tunnel between two sites, in one Ubuntu VM
 
+[English](README.md) | [Français](README.fr.md) | [日本語](README.ja.md) | [Español](README.es.md)
+
 [![check](https://github.com/mitsurutech/lab-wireguard/actions/workflows/check.yml/badge.svg)](https://github.com/mitsurutech/lab-wireguard/actions/workflows/check.yml)
 
 A ready-made **WireGuard lab** for classrooms, from the [MitsuruTech Learning Platform](https://mitsurutech.co.uk/learning), where schools and colleges give every student their own machines and terminal in the browser. Each student gets their own Ubuntu VM with two small sites built inside it, each with a gateway and a host, joined by an "internet" link that knows nothing of either private network. The student generates a **WireGuard key pair** on each gateway, writes `wg0.conf`, brings the **VPN tunnel** up and routes the two networks through it, until a host in one site can ping a host in the other. Nothing is installed on the student's computer.
@@ -56,4 +58,6 @@ More labs from the same place: [lab-netlab](https://github.com/mitsurutech/lab-n
 
 ## Licence
 
-The lab definition, the `wglab` tool and this documentation are MIT licensed, see [LICENSE](LICENSE): copy them, change them, teach with them. [WireGuard](https://www.wireguard.com) is GPL-2.0 licensed (the tools, and the module in the Ubuntu kernel) and is installed from Ubuntu's archive when a VM starts; nothing of it is distributed here.
+This work is licensed under [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/). You may share it and adapt it for learning and teaching, if you credit Mitsuru Technologies Ltd, do not use it commercially, and share anything you make from it under the same licence. The full text is in the `LICENSE` file.
+
+[WireGuard](https://www.wireguard.com) is GPL-2.0 licensed (the tools, and the module in the Ubuntu kernel) and is installed from Ubuntu's archive when a VM starts; nothing of it is distributed here.
